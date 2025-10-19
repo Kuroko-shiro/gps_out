@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>行動タイムライン（地図＋日記）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <!-- ▼▼ ここをあなたのAPIに合わせて変更 ▼▼ -->
+  <meta name="api-base" content="https://hnuu6hrszj.execute-api.us-east-1.amazonaws.com/prod" />
+  <!-- APIキーを使っていなければ空でOK -->
+  <meta name="api-key"  content="" />
+  <!-- ▲▲ -->
+
+  <link rel="stylesheet" href="style.css" />
+  <!-- Leaflet（地図表示用） -->
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>行動タイムライン</h1>
+    <div class="controls">
+      <label>Device ID
+        <input id="deviceId" placeholder="web-xxxxxx" />
+      </label>
+      <label>日付(UTC)
+        <input id="date" type="date" />
+      </label>
+      <button id="prev">前日</button>
+      <button id="next">翌日</button>
+      <button id="load">読み込み</button>
+    </div>
+    <div id="status" class="status"></div>
+  </header>
+
+  <main>
+    <section class="map-panel">
+      <div id="map"></div>
+      <div class="legend">
+        <span class="dot stay"></span>滞在
+        <span class="dot visit"></span>立寄り
+        <span class="line trip"></span>移動
+      </div>
+    </section>
+
+    <section class="info-panel">
+      <h2>日記</h2>
+      <div id="diary" class="diary"></div>
+
+      <h3>サマリ</h3>
+      <ul id="summary" class="summary"></ul>
+
+      <details>
+        <summary>取得JSON（デバッグ用）</summary>
+        <pre id="raw"></pre>
+      </details>
+    </section>
+  </main>
+
+  <footer>
+    <small>Powered by Amazon Location, S3, Lambda, API Gateway</small>
+  </footer>
+</body>
+</html>
