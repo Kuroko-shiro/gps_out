@@ -1,178 +1,175 @@
-// ===== 1) 設定（index.html の <meta> から読む） =====
-function getApiBase() {
-  return document.querySelector('meta[name="api-base"]')?.content?.trim() || "";
-}
-function getApiKey() {
-  return document.querySelector('meta[name="api-key"]')?.content?.trim() || "";
-}
+/* ===== タイムライン Viewer =====
+ * 必要なHTML要素:
+ *  - 合計距離表示: <span id="summary-total"></span>
+ *  - トリップ件数: <span id="summary-count"></span>
+ *  - 地図: <div id="map"></div>  (CSSで高さを指定: #map {height: 420px})
+ *
+ * 期待するAPIレスポンス:
+ * {
+ *   ok: true,
+ *   trips: [{ distance_km: 1.23, from:{lat,lon,time,label}, to:{...}, ...}, ...],
+ *   geojson: { type:"FeatureCollection", features:[ {geometry:{type:"LineString",coordinates:[[lon,lat],...]}, properties:{...}}, ... ] },
+ *   stays: [...], visits: [...]
+ * }
+ */
 
-// ===== 2) DOM =====
-const $id = (s)=>document.getElementById(s);
-const deviceIdInput = $id("deviceId");
-const dateInput     = $id("date");
-const prevBtn       = $id("prev");
-const nextBtn       = $id("next");
-const loadBtn       = $id("load");
-const statusBox     = $id("status");
-const diaryBox      = $id("diary");
-const summaryList   = $id("summary");
-const rawBox        = $id("raw");
+const API_BASE = window.VIEWER_API_BASE; // 例: 'https://xxxxx.execute-api.us-east-1.amazonaws.com/prod'
+const DEFAULT_DEVICE = window.DEFAULT_DEVICE_ID || '';
+const DEFAULT_DATE = window.DEFAULT_DATE || '';
 
-let map, stayLayer, visitLayer, tripLayer;
+/* ---- DOM ---- */
+const elTotalKm   = document.getElementById('summary-total');
+const elTripCount = document.getElementById('summary-count');
 
-// ===== 3) 起動時の初期化 =====
-document.addEventListener("DOMContentLoaded", () => {
-  // localStorage に保存してある deviceId を入れる（無ければ空）
-  const saved = localStorage.getItem("deviceId");
-  if (saved) deviceIdInput.value = saved;
+/* ---- Map (MapLibre or Amazon Location) ---- */
+let map; // maplibregl.Map 互換
 
-  // 初期日付は今日（UTC）
-  const todayUtc = new Date().toISOString().slice(0,10);
-  dateInput.value = dateInput.value || todayUtc;
+function ensureMap() {
+  if (map) return map;
 
-  // 地図初期化（OSMタイル）
-  initMap();
+  // MapLibre GL が読み込まれている前提（<script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js">）
+  map = new maplibregl.Map({
+    container: 'map',
+    style: 'https://demotiles.maplibre.org/style.json', // Amazon Locationのスタイルに差し替え可
+    center: [139.7000, 35.6800],
+    zoom: 9
+  });
 
-  // イベント
-  prevBtn.addEventListener("click", () => shiftDate(-1));
-  nextBtn.addEventListener("click", () => shiftDate(+1));
-  loadBtn.addEventListener("click", () => loadTimeline());
-  deviceIdInput.addEventListener("keydown", e=>{ if(e.key==="Enter") loadTimeline(); });
-  dateInput.addEventListener("keydown", e=>{ if(e.key==="Enter") loadTimeline(); });
-
-  // 初回ロード
-  loadTimeline();
-});
-
-// ===== 4) 地図初期化 =====
-function initMap() {
-  map = L.map('map');
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
-  map.setView([35.681,139.767], 11); // 東京駅付近
-}
-
-// ===== 5) ユーティリティ =====
-function setStatus(msg) { statusBox.textContent = msg; }
-function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c])); }
-function fmt(s) { try { return new Date(s).toLocaleString("ja-JP"); } catch { return s || ""; } }
-
-function shiftDate(delta) {
-  const d = new Date(dateInput.value);
-  d.setUTCDate(d.getUTCDate() + delta);
-  dateInput.value = d.toISOString().slice(0,10);
-  loadTimeline();
-}
-
-function clearMapLayers() {
-  if (stayLayer) { map.removeLayer(stayLayer); stayLayer=null; }
-  if (visitLayer){ map.removeLayer(visitLayer); visitLayer=null; }
-  if (tripLayer) { map.removeLayer(tripLayer); tripLayer=null; }
-}
-
-// ===== 6) 表示API 呼び出し =====
-async function loadTimeline() {
-  const apiBase = getApiBase();
-  if (!apiBase) { setStatus("API Base が未設定です（index.html の meta を確認）"); return; }
-
-  const deviceId = deviceIdInput.value.trim();
-  if (!deviceId) { alert("deviceId を入力してください"); return; }
-  localStorage.setItem("deviceId", deviceId);
-
-  const date = dateInput.value;
-  setStatus("読み込み中…");
-
-  const headers = { "Content-Type": "application/json" };
-  const apiKey = getApiKey();
-  if (apiKey) headers["x-api-key"] = apiKey;
-
-  const url = `${apiBase}/timeline?deviceId=${encodeURIComponent(deviceId)}&date=${date}`;
-
-  try {
-    const res = await fetch(url, { headers });
-    const text = await res.text(); // ← 一旦文字列で受け取るとエラー時の中身が見やすい
-    if (!res.ok) {
-      setStatus(`HTTP ${res.status}`);
-      diaryBox.textContent = "";
-      summaryList.innerHTML = "";
-      rawBox.textContent = text; // サーバからのエラー本文を表示
-      clearMapLayers();
-      return;
+  map.addControl(new maplibregl.NavigationControl(), 'top-right');
+  map.on('load', () => {
+    // 線分ソース
+    if (!map.getSource('trip-lines')) {
+      map.addSource('trip-lines', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
     }
-    const data = JSON.parse(text);
-    rawBox.textContent = JSON.stringify(data, null, 2);
-    renderDiaryAndSummary(data);
-    renderMap(data);
-    setStatus("読み込み完了");
-  } catch (e) {
-    console.error(e);
-    setStatus("取得に失敗しました。コンソールを確認してください。");
+    // 線分レイヤ（赤）
+    if (!map.getLayer('trip-lines-layer')) {
+      map.addLayer({
+        id: 'trip-lines-layer',
+        type: 'line',
+        source: 'trip-lines',
+        paint: {
+          'line-color': '#e11d48',      // 赤（rose-600）
+          'line-width': 4,
+          'line-opacity': 0.85
+        },
+        layout: { 'line-cap': 'round', 'line-join': 'round' }
+      });
+    }
+    // 出発/到着のポイントもあると見やすい
+    if (!map.getLayer('trip-points-layer')) {
+      map.addLayer({
+        id: 'trip-points-layer',
+        type: 'circle',
+        source: 'trip-lines',
+        paint: {
+          'circle-radius': 5,
+          'circle-color': '#111827',
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#fff'
+        },
+        filter: ['==', ['geometry-type'], 'Point']
+      });
+    }
+  });
+
+  return map;
+}
+
+/* GeoJSON を地図へ反映。LineString だけでなく端点の Point も追加して可視化 */
+function renderGeoJSON(fc) {
+  const m = ensureMap();
+
+  // features が空なら何もしない
+  if (!fc || !Array.isArray(fc.features) || fc.features.length === 0) {
+    // 空データでもソースはクリアしておく
+    if (m.getSource('trip-lines')) {
+      m.getSource('trip-lines').setData({ type: 'FeatureCollection', features: [] });
+    }
+    return;
+  }
+
+  // 端点ポイントを追加（見やすさ向上）
+  const pointFeatures = [];
+  for (const f of fc.features) {
+    if (f?.geometry?.type === 'LineString' && Array.isArray(f.geometry.coordinates) && f.geometry.coordinates.length > 1) {
+      const coords = f.geometry.coordinates;
+      const from = coords[0];
+      const to   = coords[coords.length - 1];
+      pointFeatures.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: from },
+        properties: { kind: 'start', label: f.properties?.from_label || 'start' }
+      });
+      pointFeatures.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: to },
+        properties: { kind: 'end', label: f.properties?.to_label || 'end' }
+      });
+    }
+  }
+
+  const merged = {
+    type: 'FeatureCollection',
+    features: [...fc.features, ...pointFeatures]
+  };
+
+  if (m.getSource('trip-lines')) {
+    m.getSource('trip-lines').setData(merged);
+  }
+
+  // 画面に収まるようにフィット
+  try {
+    const bbox = turf.bbox(merged); // turf.js を読み込んでいる場合
+    m.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 800 });
+  } catch {
+    // turf が無くても、単純に最初の線の中心へ
+    const firstLine = fc.features.find(f => f.geometry?.type === 'LineString');
+    if (firstLine) {
+      const coords = firstLine.geometry.coordinates;
+      const mid = coords[Math.floor(coords.length / 2)];
+      m.setCenter(mid);
+      m.setZoom(11);
+    }
   }
 }
 
-// ===== 7) 地図描画（stays/visits/trips） =====
-function renderMap(data) {
-  clearMapLayers();
+/* 合計距離・件数の描画 */
+function renderSummary(trips) {
+  const count = Array.isArray(trips) ? trips.length : 0;
+  const sumKm = (Array.isArray(trips) ? trips : [])
+    .reduce((acc, t) => acc + (Number(t?.distance_km) || 0), 0);
 
-  const stays  = data.stays || [];
-  const visits = data.visits || [];
-  const trips  = data.trips || [];
-  const bounds = [];
-
-  // 滞在: 青い円マーカー（少し大きめ）
-  const stayMarkers = stays.map((s,i)=>{
-    const {lat, lon} = s.center;
-    const m = L.circleMarker([lat,lon], {
-      radius: 8, color:"#1d4ed8", fillColor:"#2563eb", fillOpacity:0.9, weight:2
-    }).bindPopup(`${escapeHtml(s.label || "滞在")}<br>${fmt(s.start)}〜${fmt(s.end)}`);
-    bounds.push([lat,lon]); 
-    return m;
-  });
-  stayLayer = L.layerGroup(stayMarkers).addTo(map);
-
-  // 立寄り: 緑の小円マーカー
-  const visitMarkers = visits.map((v,i)=>{
-    const c = v.center || v.location || {};
-    const {lat, lon} = c;
-    if (lat==null || lon==null) return null;
-    const m = L.circleMarker([lat,lon], {
-      radius: 5, color:"#15803d", fillColor:"#16a34a", fillOpacity:0.9, weight:2
-    }).bindPopup(`${escapeHtml(v.label || "立寄り")}${v.start?("<br>"+fmt(v.start)):""}`);
-    bounds.push([lat,lon]); 
-    return m;
-  }).filter(Boolean);
-  visitLayer = L.layerGroup(visitMarkers).addTo(map);
-
-  // 移動: 赤いポリライン（座標は [lon,lat] → Leaflet は [lat,lon] へ入れ替え）
-  const tripLines = trips.map(t=>{
-    const coords = (t.route && t.route.coordinates) || [];
-    if (coords.length<2) return null;
-    const latlngs = coords.map(([lon,lat])=>[lat,lon]);
-    const pl = L.polyline(latlngs, { color:"#ef4444", weight:4, opacity:0.9 });
-    bounds.push(latlngs[0], latlngs[latlngs.length-1]);
-    return pl.bindPopup(`移動(${t.mode || "-"}) 距離:${((t.distance_m||0)/1000).toFixed(1)}km`);
-  }).filter(Boolean);
-  tripLayer = L.layerGroup(tripLines).addTo(map);
-
-  // どこかに寄せる
-  if (bounds.length) map.fitBounds(bounds, { padding:[24,24] });
-  else map.setView([35.681,139.767], 11);
+  if (elTripCount) elTripCount.textContent = String(count);
+  if (elTotalKm)   elTotalKm.textContent   = `${sumKm.toFixed(2)} km`;
 }
 
-// ===== 8) 日記とサマリ描画 =====
-function renderDiaryAndSummary(data) {
-  // 日記（なければ案内文）
-  diaryBox.textContent = data.diary || "（この日の日記は未生成です）";
+/* タイムライン読み込み（ボタンや初期表示から呼ぶ） */
+async function loadTimeline(deviceId, date) {
+  const url = `${API_BASE}/timeline?deviceId=${encodeURIComponent(deviceId)}&date=${encodeURIComponent(date)}`;
+  const res = await fetch(url, { method: 'GET' });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  const json = await res.json();
 
-  // サマリ（件数と移動距離）
-  const stays = data.stays || [];
-  const trips = data.trips || [];
-  const visits= data.visits || [];
-  const totalDistKm = (trips.reduce((a,t)=>a+(t.distance_m||0),0)/1000).toFixed(1);
+  // 1) サマリ
+  renderSummary(json.trips || []);
 
-  const items = [
-    `滞在: ${stays.length} 件`,
-    `立寄り: ${visits.length} 件`,
-    `移動: ${trips.length} 区間 / 合計距離 ${totalDistKm} km`
-  ];
-  summaryList.innerHTML = items.map(s=>`<li>${escapeHtml(s)}</li>`).join("");
+  // 2) 地図（赤線）
+  renderGeoJSON(json.geojson || { type: 'FeatureCollection', features: [] });
+
+  // 3) 必要なら滞在やダイアリもここで反映
+  //    json.stays / json.visits / json.diary ...
 }
+
+/* 例: ページ初期化時に読み込む */
+document.addEventListener('DOMContentLoaded', () => {
+  ensureMap();
+  if (DEFAULT_DEVICE && DEFAULT_DATE) {
+    loadTimeline(DEFAULT_DEVICE, DEFAULT_DATE)
+      .catch(err => console.error('loadTimeline failed:', err));
+  }
+});
