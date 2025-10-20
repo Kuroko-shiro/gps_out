@@ -2,65 +2,175 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>行動タイムライン（地図＋日記）</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>行動タイムラインビュー</title>
 
-  <!-- ▼▼ ここをあなたのAPIに合わせて変更 ▼▼ -->
-  <meta name="api-base" content="https://hnuu6hrszj.execute-api.us-east-1.amazonaws.com/prod" />
-  <!-- APIキーを使っていなければ空でOK -->
-  <meta name="api-key"  content="" />
-  <!-- ▲▲ -->
+  <!-- MapLibre GL -->
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css">
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
 
-  <link rel="stylesheet" href="style.css" />
-  <!-- Leaflet（地図表示用） -->
-  <link rel="stylesheet"
-        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script defer src="app.js"></script>
+  <!-- Turf.js（bbox計算に使用。無くても動きます）-->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <style>
+    :root { --bg:#0b1020; --panel:#121a2f; --text:#e5e7eb; --muted:#9ca3af; --accent:#60a5fa; --danger:#e11d48; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif; background: var(--bg); color: var(--text); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    header { padding: 16px 20px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border-bottom: 1px solid rgba(255,255,255,0.06); }
+    header h1 { font-size: 18px; font-weight: 700; margin: 0; letter-spacing: .02em; }
+    .spacer { flex: 1; }
+
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+
+    .controls { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end; margin-bottom: 12px; }
+    .ctrl { display: flex; flex-direction: column; gap: 6px; }
+    label { font-size: 12px; color: var(--muted); }
+    input, button, select {
+      padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); background: #0f172a; color: var(--text);
+      border-radius: 10px; outline: none;
+    }
+    button.primary { background: var(--accent); color: #0a0e1a; font-weight: 700; border: none; cursor: pointer; }
+    button.primary:hover { filter: brightness(1.05); }
+
+    .grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 960px) { .grid { grid-template-columns: 340px 1fr; } }
+
+    .card { background: var(--panel); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; box-shadow: 0 6px 18px rgba(0,0,0,0.25); }
+    .card h2 { margin: 0; font-size: 14px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+    .card .body { padding: 14px; }
+
+    .summary { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .kpi { padding: 10px 12px; background: #0c1428; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; }
+    .kpi .num { font-size: 22px; font-weight: 800; }
+    .kpi .cap { font-size: 12px; color: var(--muted); }
+
+    #map { width: 100%; height: 420px; border-radius: 12px; overflow: hidden; }
+    .muted { color: var(--muted); font-size: 13px; }
+
+    footer { padding: 16px; text-align: center; color: var(--muted); font-size: 12px; }
+    .link-row { margin-left: 6px; font-size: 13px; }
+  </style>
+
+  <!-- ▼ ここをあなたの環境に合わせて設定！ -->
+  <script>
+    // 表示APIのエンドポイント（ステージ付き）
+    window.VIEWER_API_BASE = "https://hnuu6hrszj.execute-api.us-east-1.amazonaws.com/prod";  // 例: https://hnuu6hrszj.execute-api.us-east-1.amazonaws.com/prod
+    // デフォルトの deviceId / date （ページ表示時に自動読込）
+    window.DEFAULT_DEVICE_ID = "web-demo";     // 例: web-z07az6gr
+    window.DEFAULT_DATE      = "2025-10-20";   // UTC基準の日付
+    // 入力用アプリ（記録アプリ）へのリンク
+    window.INPUT_APP_URL     = "https://main.d3axstxp3s3nrt.amplifyapp.com/"; // 例: https://main.d1noa7p54uqelv.amplifyapp.com/
+  </script>
 </head>
 <body>
   <header>
-    <h1>行動タイムライン</h1>
-    <div class="controls">
-      <label>Device ID
-        <input id="deviceId" placeholder="web-xxxxxx" />
-      </label>
-      <label>日付(UTC)
-        <input id="date" type="date" />
-      </label>
-      <button id="prev">前日</button>
-      <button id="next">翌日</button>
-      <button id="load">読み込み</button>
+    <h1>行動タイムラインビュー</h1>
+    <div class="spacer"></div>
+    <div class="link-row">
+      <a id="link-input" href="#" target="_blank" rel="noopener">📥 入力アプリへ</a>
     </div>
-    <div id="status" class="status"></div>
   </header>
 
-  <main>
-    <section class="map-panel">
-      <div id="map"></div>
-      <div class="legend">
-        <span class="dot stay"></span>滞在
-        <span class="dot visit"></span>立寄り
-        <span class="line trip"></span>移動
+  <main class="wrap">
+    <section class="controls">
+      <div class="ctrl">
+        <label for="deviceId">Device ID</label>
+        <input id="deviceId" type="text" placeholder="web-xxxxxx">
+      </div>
+      <div class="ctrl">
+        <label for="date">Date (UTC, YYYY-MM-DD)</label>
+        <input id="date" type="date">
+      </div>
+      <div class="ctrl">
+        <button id="loadBtn" class="primary">読み込む</button>
       </div>
     </section>
 
-    <section class="info-panel">
-      <h2>日記</h2>
-      <div id="diary" class="diary"></div>
+    <section class="grid">
+      <div class="card">
+        <div class="body">
+          <h2>Summary</h2>
+          <div class="summary" style="margin-top:10px">
+            <div class="kpi">
+              <div class="num"><span id="summary-total">0.00</span></div>
+              <div class="cap">合計距離 (km)</div>
+            </div>
+            <div class="kpi">
+              <div class="num"><span id="summary-count">0</span></div>
+              <div class="cap">移動回数</div>
+            </div>
+          </div>
+          <p class="muted" style="margin-top:12px">
+            ※ 距離は Route Calculator 設定時は道路距離、未設定時は直線距離で算出されます。
+          </p>
+        </div>
+      </div>
 
-      <h3>サマリ</h3>
-      <ul id="summary" class="summary"></ul>
-
-      <details>
-        <summary>取得JSON（デバッグ用）</summary>
-        <pre id="raw"></pre>
-      </details>
+      <div class="card">
+        <div class="body">
+          <h2>Map</h2>
+          <div id="map" style="margin-top:10px"></div>
+        </div>
+      </div>
     </section>
   </main>
 
   <footer>
-    <small>Powered by Amazon Location, S3, Lambda, API Gateway</small>
+    © Timeline Demo
   </footer>
+
+  <!-- あなたの app.js を同ディレクトリに置いて読み込み -->
+  <script src="./app.js"></script>
+
+  <!-- ちょい足し：UI配線（app.jsのAPI関数を呼ぶだけの薄いコード） -->
+  <script>
+    // app.js 側の公開関数に合わせてあります
+    const $ = (id) => document.getElementById(id);
+
+    // 入力アプリへのリンク
+    document.getElementById('link-input').href = window.INPUT_APP_URL || '#';
+
+    // 初期値をセット
+    document.addEventListener('DOMContentLoaded', () => {
+      if (window.DEFAULT_DEVICE_ID) $('deviceId').value = window.DEFAULT_DEVICE_ID;
+      if (window.DEFAULT_DATE)      $('date').value     = window.DEFAULT_DATE;
+    });
+
+    // 読み込みボタン
+    $('loadBtn').addEventListener('click', () => {
+      const deviceId = $('deviceId').value.trim();
+      const date     = $('date').value.trim();
+      if (!deviceId || !date) {
+        alert('Device ID と Date を入力してください');
+        return;
+      }
+      // app.js の loadTimeline を呼び出し
+      if (typeof loadTimeline === 'function') {
+        loadTimeline(deviceId, date).catch(err => {
+          console.error(err);
+          alert('読み込みに失敗しました。Console をご確認ください。');
+        });
+      } else {
+        alert('app.js が読み込まれていません。');
+      }
+    });
+
+    // ページ表示と同時に自動読み込み（デフォルト値がある場合）
+    window.addEventListener('load', () => {
+      const did = $('deviceId').value.trim();
+      const d   = $('date').value.trim();
+      if (did && d && typeof loadTimeline === 'function') {
+        loadTimeline(did, d).catch(console.error);
+      }
+    });
+
+    // app.js が参照する設定を window に供給
+    window.VIEWER_API_BASE = window.VIEWER_API_BASE || "";
+    window.DEFAULT_DEVICE_ID = window.DEFAULT_DEVICE_ID || "";
+    window.DEFAULT_DATE = window.DEFAULT_DATE || "";
+  </script>
 </body>
 </html>
