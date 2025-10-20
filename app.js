@@ -1,11 +1,3 @@
-/****************************************************
- * Timeline Viewer (MapLibre 版)
- * - meta[name="api-base"], meta[name="api-key"] を読んで /timeline に GET
- * - レスポンス: { ok, deviceId, date, stays[], visits[], trips[], geojson{FC}, diary }
- * - MapLibre で trips(LineString) を赤線表示、stays/visits をポイント表示
- * - サマリ: 合計距離と件数を一覧に反映
- ****************************************************/
-
 // ---- 設定取得 ----
 function getApiBase() {
   return (document.querySelector('meta[name="api-base"]')?.content || '').trim();
@@ -27,79 +19,93 @@ const elRaw      = document.getElementById('raw');
 
 // ---- MapLibre ----
 let map; // maplibregl.Map
+// === MapTiler + MapLibre 用の ensureMap() ===
 function ensureMap() {
-  if (map) return map;
-  const container = document.getElementById('map');
-  if (!window.maplibregl) {
-    setStatus('⚠️ MapLibre が読み込まれていません。CDNタグをご確認ください。');
-    return null;
+  if (window.map) return window.map;
+
+  // 1) APIキーを index.html の <meta> から読む
+  const MAPTILER_KEY =
+    document.querySelector('meta[name="maptiler-key"]')?.content?.trim() || "";
+
+  if (!MAPTILER_KEY) {
+    console.warn("⚠️ MapTiler APIキーが未設定です。<meta name=\"maptiler-key\" ... > を入れてください。");
   }
-  // 必要に応じて Amazon Location のスタイルに置換できます
-  map = new maplibregl.Map({
-    container: 'map',
-    style: 'https://demotiles.maplibre.org/style.json',
-    center: [139.7000, 35.6800],
-    zoom: 9
-  });
-  map.addControl(new maplibregl.NavigationControl(), 'top-right');
 
-  map.on('load', () => {
-    // 線（trips）ソース
-    if (!map.getSource('timeline')) {
-      map.addSource('timeline', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] }
-      });
-    }
-    // 移動：赤い線
-    if (!map.getLayer('trip-lines')) {
-      map.addLayer({
-        id: 'trip-lines',
-        type: 'line',
-        source: 'timeline',
-        paint: {
-          'line-color': '#e11d48',
-          'line-width': 4,
-          'line-opacity': 0.9
-        },
-        filter: ['==', ['geometry-type'], 'LineString'],
-        layout: { 'line-cap': 'round', 'line-join': 'round' }
-      });
-    }
-    // 滞在：濃色ポイント
-    if (!map.getLayer('stay-points')) {
-      map.addLayer({
-        id: 'stay-points',
-        type: 'circle',
-        source: 'timeline',
-        paint: {
-          'circle-radius': 6,
-          'circle-color': '#1f2937',      // slate-800
-          'circle-stroke-color': '#ffffff',
-          'circle-stroke-width': 2
-        },
-        filter: ['all', ['==', ['geometry-type'], 'Point'], ['==', ['get', 'kind'], 'stay']]
-      });
-    }
-    // 立寄り：水色ポイント
-    if (!map.getLayer('visit-points')) {
-      map.addLayer({
-        id: 'visit-points',
-        type: 'circle',
-        source: 'timeline',
-        paint: {
-          'circle-radius': 5,
-          'circle-color': '#60a5fa',      // sky-400
-          'circle-stroke-color': '#0b1020',
-          'circle-stroke-width': 2
-        },
-        filter: ['all', ['==', ['geometry-type'], 'Point'], ['==', ['get', 'kind'], 'visit']]
-      });
-    }
+  // 2) 使うスタイル（地名・POIが出る “streets-v2” を推奨）
+  // ほか: outdoor-v2 / basic-v2 / topo-v2 など
+  const STYLE = `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`;
+
+  // 3) MapLibre マップ生成
+  window.map = new maplibregl.Map({
+    container: "map",
+    style: STYLE,
+    center: [139.7000, 35.6800], // 初期表示（新宿周辺など）
+    zoom: 10
   });
 
-  return map;
+  // ズーム・向きコントロール
+  window.map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+  // 著作表示（MapTiler のクレジットは必須）
+  window.map.addControl(
+    new maplibregl.AttributionControl({
+      customAttribution: '© MapTiler © OpenStreetMap contributors'
+    })
+  );
+
+  // あなたの既存処理：ソース/レイヤの作成（なければ初期化）
+  window.map.on("load", () => {
+    if (!window.map.getSource("timeline")) {
+      window.map.addSource("timeline", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] }
+      });
+    }
+
+    // 既存のレイヤ追加（例：滞在/立寄り/移動線）
+    if (!window.map.getLayer("trip-lines")) {
+      window.map.addLayer({
+        id: "trip-lines",
+        type: "line",
+        source: "timeline",
+        filter: ["==", ["get", "layer"], "trip"],
+        layout: { "line-join": "round", "line-cap": "round" },
+        paint: { "line-color": "#d85866", "line-width": 4, "line-opacity": 0.9 }
+      });
+    }
+    if (!window.map.getLayer("stay-points")) {
+      window.map.addLayer({
+        id: "stay-points",
+        type: "circle",
+        source: "timeline",
+        filter: ["==", ["get", "layer"], "stay"],
+        paint: {
+          "circle-radius": 7,
+          "circle-color": "#1e3a8a",
+          "circle-stroke-color": "#ffffff",
+          "circle-stroke-width": 2
+        }
+      });
+    }
+    if (!window.map.getLayer("visit-points")) {
+      window.map.addLayer({
+        id: "visit-points",
+        type: "circle",
+        source: "timeline",
+        filter: ["==", ["get", "layer"], "visit"],
+        paint: {
+          "circle-radius": 6,
+          "circle-color": "#0ea5e9",
+          "circle-stroke-color": "#ffffff",
+          "circle-stroke-width": 2
+        }
+      });
+    }
+  });
+
+  return window.map;
 }
+
 
 // GeoJSON描画（LineString + stays/visits の points をマージ）
 function renderGeo(fc, stays, visits) {
