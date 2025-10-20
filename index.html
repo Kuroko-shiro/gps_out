@@ -2,32 +2,32 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
+  <title>行動タイムライン（地図＋日記）</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>行動タイムライン</title>
 
-  <!-- MapLibre GL -->
-  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css">
-  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+  <!-- ▼▼ ここをあなたのAPIに合わせて変更 ▼▼ -->
+  <meta name="api-base" content="https://hnuu6hrszj.execute-api.us-east-1.amazonaws.com/prod" />
+  <!-- APIキーを使っていなければ空でOK -->
+  <meta name="api-key"  content="" />
+  <!-- ▲▲ -->
 
-  <!-- Turf.js（bbox計算に使用。無くても動きます）-->
-  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
-  link rel="stylesheet" href="style.css" />
-  <!-- Leaflet（地図表示用） -->
-  <link rel="stylesheet"
-        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- Leaflet（従来のまま残しますが今回は未使用） -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script defer src="app.js"></script>
 
-  <!-- ▼ ここをあなたの環境に合わせて設定！ -->
-  <script>
-    // 表示APIのエンドポイント（ステージ付き）
-    window.VIEWER_API_BASE = "https://hnuu6hrszj.execute-api.us-east-1.amazonaws.com/prod";  // 例: https://hnuu6hrszj.execute-api.us-east-1.amazonaws.com/prod
-    // デフォルトの deviceId / date （ページ表示時に自動読込）
-    window.DEFAULT_DEVICE_ID = "web-demo";     // 例: web-z07az6gr
-    window.DEFAULT_DATE      = "2025-10-20";   // UTC基準の日付
-    // 入力用アプリ（記録アプリ）へのリンク
-    window.INPUT_APP_URL     = "https://main.d3axstxp3s3nrt.amplifyapp.com/"; // 例: https://main.d1noa7p54uqelv.amplifyapp.com/
-  </script>
+  <!-- ▼ MapLibre（追加） -->
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" />
+  <script defer src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+  <!-- bbox計算用（任意。無くても動きます） -->
+  <script defer src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <script defer src="app.js"></script>
+  <style>
+    /* 念のため map の高さがゼロにならないように */
+    #map { min-height: 420px; }
+  </style>
 </head>
 <body>
   <header>
