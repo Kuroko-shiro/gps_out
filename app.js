@@ -1,17 +1,18 @@
 /*******************************************************
  * 行動タイムライン ビューア（MapLibre + API）
- * - HTML 側にある <meta name="api-base"> / <meta name="api-key"> を使用
+ * - <meta name="api-base"> / <meta name="api-key"> を使用
  * - ルート（LineString）と 滞在/立寄り（Point）を描画
  * - サマリ（合計距離・件数）と日記テキストを表示
+ * - 滞在/立寄りポイントは、geojson に無くても stays/visits から補完
  *******************************************************/
 
 /* ========= 設定の読み込み ========= */
 function meta(name, fallback = "") {
   return (document.querySelector(`meta[name="${name}"]`)?.content || fallback).trim();
 }
-const API_BASE = meta("api-base", "");     // 例: https://xxxxx.execute-api.us-east-1.amazonaws.com/prod
-const API_KEY  = meta("api-key", "");      // 未使用なら空でOK
-const MAPTILER_KEY = meta("maptiler-key", ""); // 未設定ならデモスタイル
+const API_BASE = meta("api-base", "https://hnuu6hrszj.execute-api.us-east-1.amazonaws.com/prod");           // 例: https://xxxxx.execute-api.us-east-1.amazonaws.com/prod
+const API_KEY  = meta("api-key", "");            // 未使用なら空でOK
+const MAPTILER_KEY = meta("maptiler-key", "zDVOQBS4Owriuq8wXYs4");   // 未設定ならデモスタイルにフォールバック
 
 /* ========= DOM 参照 ========= */
 const elDevice = document.getElementById("deviceId");
@@ -34,8 +35,8 @@ function ensureMap() {
   }
 
   const styleUrl = MAPTILER_KEY
-    ? `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`
-    : "https://demotiles.maplibre.org/style.json"; // フォールバック
+    ? `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}` // 地名・POIが豊富
+    : "https://demotiles.maplibre.org/style.json";                               // フォールバック
 
   mlMap = new maplibregl.Map({
     container: "map",
@@ -48,8 +49,8 @@ function ensureMap() {
   return mlMap;
 }
 
-/* ========= GeoJSON を地図に描画 ========= */
-function renderGeo(geojson) {
+/* ========= GeoJSON 表示（stays/visits 補完・フィルタ両対応） ========= */
+function renderGeo(geojson, stays = [], visits = []) {
   const m = ensureMap();
   if (typeof m.getSource !== "function") {
     throw new Error("MapLibre map not initialized correctly.");
@@ -66,53 +67,79 @@ function renderGeo(geojson) {
     [ROUTE_LAYER, STAY_LAYER, VISIT_LAYER].forEach(id => { if (m.getLayer(id)) m.removeLayer(id); });
     [ROUTE_SRC, PT_SRC].forEach(id => { if (m.getSource(id)) m.removeSource(id); });
 
-    // LineString を抽出
-    const lineFeatures = [];
-    const pointFeatures = [];
-    (geojson.features || []).forEach(f => {
-      if (!f || !f.geometry) return;
-      if (f.geometry.type === "LineString") lineFeatures.push(f);
-      if (f.geometry.type === "Point") pointFeatures.push(f);
-    });
+    // もとの features をコピー
+    const base = (geojson && Array.isArray(geojson.features)) ? geojson : { type:'FeatureCollection', features: [] };
+    const features = [...base.features];
 
-    if (lineFeatures.length) {
-      m.addSource(ROUTE_SRC, {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: lineFeatures }
-      });
+    // --- stays/visits の点を補完して必ず載せる ---
+    if (Array.isArray(stays)) {
+      for (const s of stays) {
+        const c = s?.center || {};
+        const lat = parseFloat(c.lat ?? c.latitude);
+        const lon = parseFloat(c.lon ?? c.longitude);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          features.push({
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [lon, lat] },
+            properties: { kind: "stay", layer: "stay", label: s.label || "", start: s.start || "", end: s.end || "" }
+          });
+        }
+      }
+    }
+    if (Array.isArray(visits)) {
+      for (const v of visits) {
+        const c = v?.center || {};
+        const lat = parseFloat(c.lat ?? c.latitude);
+        const lon = parseFloat(c.lon ?? c.longitude);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          features.push({
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [lon, lat] },
+            properties: { kind: "visit", layer: "visit", label: v.label || "", start: v.start || "", end: v.end || "" }
+          });
+        }
+      }
+    }
+
+    // 1) ルート（LineString まとめ）
+    const lineFC = {
+      type: "FeatureCollection",
+      features: features.filter(f => f.geometry?.type === "LineString")
+    };
+    if (lineFC.features.length) {
+      m.addSource(ROUTE_SRC, { type: "geojson", data: lineFC });
       m.addLayer({
-        id: ROUTE_LAYER,
-        type: "line",
-        source: ROUTE_SRC,
+        id: ROUTE_LAYER, type: "line", source: ROUTE_SRC,
         paint: { "line-color": "#d9534f", "line-width": 4, "line-opacity": 0.9 }
       });
     }
 
-    if (pointFeatures.length) {
-      m.addSource(PT_SRC, {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: pointFeatures }
-      });
+    // 2) 点（stay/visit まとめ）
+    const pointFC = {
+      type: "FeatureCollection",
+      features: features.filter(f => f.geometry?.type === "Point")
+    };
+    if (pointFC.features.length) {
+      m.addSource(PT_SRC, { type: "geojson", data: pointFC });
+
+      // フィルタは kind と layer のどちらでも通るよう OR 条件
+      const isStay  = ["any", ["==", ["get","kind"], "stay"],  ["==", ["get","layer"], "stay"]];
+      const isVisit = ["any", ["==", ["get","kind"], "visit"], ["==", ["get","layer"], "visit"]];
+
       m.addLayer({
-        id: STAY_LAYER,
-        type: "circle",
-        source: PT_SRC,
-        filter: ["==", ["get", "kind"], "stay"],
+        id: STAY_LAYER, type: "circle", source: PT_SRC, filter: ["all", isStay],
         paint: {
           "circle-radius": 6,
-          "circle-color": "#2e7d32",
+          "circle-color": "#1976d2",        // 滞在＝青
           "circle-stroke-color": "#ffffff",
           "circle-stroke-width": 2
         }
       });
       m.addLayer({
-        id: VISIT_LAYER,
-        type: "circle",
-        source: PT_SRC,
-        filter: ["==", ["get", "kind"], "visit"],
+        id: VISIT_LAYER, type: "circle", source: PT_SRC, filter: ["all", isVisit],
         paint: {
           "circle-radius": 6,
-          "circle-color": "#1976d2",
+          "circle-color": "#2e7d32",        // 立寄り＝緑（お好みで）
           "circle-stroke-color": "#ffffff",
           "circle-stroke-width": 2
         }
@@ -131,7 +158,7 @@ function renderGeo(geojson) {
           const end   = p.end || "";
           popup.setLngLat([lon, lat]).setHTML(`
             <div style="font-size:12px">
-              <div><b>${p.kind === "stay" ? "滞在" : "立寄り"}</b></div>
+              <div><b>${(p.kind || p.layer) === "stay" ? "滞在" : "立寄り"}</b></div>
               ${label ? `<div>${escapeHtml(label)}</div>` : ""}
               ${start ? `<div>開始: ${escapeHtml(start)}</div>` : ""}
               ${end   ? `<div>終了: ${escapeHtml(end)}</div>` : ""}
@@ -142,15 +169,20 @@ function renderGeo(geojson) {
       });
     }
 
-    // 画面フィット
+    // 3) 画面フィット
     try {
+      const merged = { type: "FeatureCollection", features };
       if (window.turf) {
-        const bbox = turf.bbox(geojson);
+        const bbox = turf.bbox(merged);
         m.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 400 });
       } else {
         const coords = [];
-        lineFeatures.forEach(f => coords.push(...f.geometry.coordinates));
-        pointFeatures.forEach(f => coords.push(f.geometry.coordinates));
+        merged.features.forEach(f => {
+          const g = f.geometry;
+          if (!g) return;
+          if (g.type === "Point") coords.push(g.coordinates);
+          if (g.type === "LineString") coords.push(...g.coordinates);
+        });
         if (coords.length) {
           const xs = coords.map(c => c[0]);
           const ys = coords.map(c => c[1]);
@@ -165,7 +197,7 @@ function renderGeo(geojson) {
   if (mlMap.loaded()) onReady(); else mlMap.once("load", onReady);
 }
 
-/* ========= サマリ計算 ========= */
+/* ========= サマリ（合計距離） ========= */
 function haversineKm(a, b) {
   const R = 6371;
   const toRad = d => d * Math.PI / 180;
@@ -179,7 +211,6 @@ function haversineKm(a, b) {
 function totalDistanceKm(geojson) {
   try {
     if (window.turf) {
-      // すべての LineString を合算
       return (geojson.features || []).reduce((sum, f) => {
         if (f.geometry?.type === "LineString") {
           return sum + turf.length(f, { units: "kilometers" });
@@ -188,7 +219,6 @@ function totalDistanceKm(geojson) {
       }, 0);
     }
   } catch {}
-  // Turf なし: 簡易合算
   let total = 0;
   (geojson.features || []).forEach(f => {
     if (f.geometry?.type !== "LineString") return;
@@ -240,7 +270,7 @@ async function loadTimeline() {
 
   setStatus("読み込み中…");
   try {
-    const url = `${API_BASE}/timeline?deviceId=${encodeURIComponent(deviceId)}&date=${encodeURIComponent(date)}`;
+    const url = `${API_BASE.replace(/\/$/, "")}/timeline?deviceId=${encodeURIComponent(deviceId)}&date=${encodeURIComponent(date)}`;
     const headers = { "Content-Type": "application/json" };
     if (API_KEY) headers["x-api-key"] = API_KEY;
 
@@ -250,14 +280,15 @@ async function loadTimeline() {
 
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${JSON.stringify(json)}`);
 
-    // geojson が無ければ作る（後方互換）
+    // geojson が無ければ trips から最小構成を作る（後方互換）
     let geo = json.geojson;
     if (!geo || !geo.features) {
       geo = buildGeoJsonFromPayload(json);
       json.geojson = geo;
     }
 
-    renderGeo(geo);
+    // 地図・サマリ・日記
+    renderGeo(geo, json.stays || [], json.visits || []);
     updateSummary(json);
     updateDiary(json);
     setStatus("読み込み完了");
@@ -276,22 +307,20 @@ function buildGeoJsonFromPayload(p) {
     if (tr.geometry?.type === "LineString") {
       feats.push({
         type: "Feature",
-        properties: { kind: "trip" },
+        properties: { kind: "trip", layer: "trip" },
         geometry: { type: "LineString", coordinates: tr.geometry.coordinates }
       });
     }
   });
 
-  // stays/visits を点に
+  // stays/visits を点に（描画側でも補完するが、ここでも入れておく）
   (p.stays || []).forEach(s => {
     if (!s.center) return;
     feats.push({
       type: "Feature",
       properties: {
-        kind: "stay",
-        label: s.label || "",
-        start: s.start || "",
-        end: s.end || ""
+        kind: "stay", layer: "stay",
+        label: s.label || "", start: s.start || "", end: s.end || ""
       },
       geometry: { type: "Point", coordinates: [s.center.lon, s.center.lat] }
     });
@@ -302,10 +331,8 @@ function buildGeoJsonFromPayload(p) {
     feats.push({
       type: "Feature",
       properties: {
-        kind: "visit",
-        label: v.label || "",
-        start: v.start || "",
-        end: v.end || ""
+        kind: "visit", layer: "visit",
+        label: v.label || "", start: v.start || "", end: v.end || ""
       },
       geometry: { type: "Point", coordinates: [v.center.lon, v.center.lat] }
     });
@@ -315,9 +342,7 @@ function buildGeoJsonFromPayload(p) {
 }
 
 /* ========= ユーティリティ ========= */
-function setStatus(msg) {
-  elStatus.textContent = msg;
-}
+function setStatus(msg) { elStatus.textContent = msg; }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
@@ -335,7 +360,7 @@ elNext?.addEventListener("click", () => { elDate.value = addDays(elDate.value, +
 /* ========= 初期化 ========= */
 document.addEventListener("DOMContentLoaded", () => {
   // 入力の復元
-  const savedDev = localStorage.getItem("viewer:deviceId") || "";
+  const savedDev  = localStorage.getItem("viewer:deviceId") || "";
   const savedDate = localStorage.getItem("viewer:date") || new Date().toISOString().slice(0,10);
   if (savedDev) elDevice.value = savedDev;
   if (savedDate) elDate.value = savedDate;
@@ -343,10 +368,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // 地図だけ先に作成
   try { ensureMap(); } catch (e) { console.warn(e.message); }
 
-  if (API_BASE && savedDev) {
-    // 自動ロードしたければここで呼ぶ
-    // loadTimeline();
-  } else if (!API_BASE) {
+  if (!API_BASE) {
     setStatus("⚠️ API Base が未設定です。<meta name=\"api-base\"> を設定してください。");
   }
 });
