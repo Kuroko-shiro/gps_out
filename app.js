@@ -1,273 +1,352 @@
-// ---- 設定取得 ----
-function getApiBase() {
-  return (document.querySelector('meta[name="api-base"]')?.content || '').trim();
-}
-function getApiKey() {
-  return (document.querySelector('meta[name="api-key"]')?.content || '').trim();
-}
+/*******************************************************
+ * 行動タイムライン ビューア（MapLibre + API）
+ * - HTML 側にある <meta name="api-base"> / <meta name="api-key"> を使用
+ * - ルート（LineString）と 滞在/立寄り（Point）を描画
+ * - サマリ（合計距離・件数）と日記テキストを表示
+ *******************************************************/
 
-// ---- DOM ----
-const elDevice   = document.getElementById('deviceId');
-const elDate     = document.getElementById('date');
-const btnPrev    = document.getElementById('prev');
-const btnNext    = document.getElementById('next');
-const btnLoad    = document.getElementById('load');
-const elStatus   = document.getElementById('status');
-const elDiary    = document.getElementById('diary');
-const elSummary  = document.getElementById('summary');
-const elRaw      = document.getElementById('raw');
+/* ========= 設定の読み込み ========= */
+function meta(name, fallback = "") {
+  return (document.querySelector(`meta[name="${name}"]`)?.content || fallback).trim();
+}
+const API_BASE = meta("api-base", "");     // 例: https://xxxxx.execute-api.us-east-1.amazonaws.com/prod
+const API_KEY  = meta("api-key", "");      // 未使用なら空でOK
+const MAPTILER_KEY = meta("maptiler-key", ""); // 未設定ならデモスタイル
 
-// ---- MapLibre ----
-let map; // maplibregl.Map
-// === MapTiler + MapLibre 用の ensureMap() ===
+/* ========= DOM 参照 ========= */
+const elDevice = document.getElementById("deviceId");
+const elDate   = document.getElementById("date");
+const elPrev   = document.getElementById("prev");
+const elNext   = document.getElementById("next");
+const elLoad   = document.getElementById("load");
+const elStatus = document.getElementById("status");
+const elDiary  = document.getElementById("diary");
+const elSummary= document.getElementById("summary");
+const elRaw    = document.getElementById("raw");
+
+/* ========= MapLibre 初期化（Leaflet があっても MapLibre を必ず使う） ========= */
+let mlMap = null;
 function ensureMap() {
-  if (window.map) return window.map;
+  if (mlMap && typeof mlMap.getSource === "function") return mlMap;
 
-  // 1) APIキーを index.html の <meta> から読む
-  const MAPTILER_KEY =
-    document.querySelector('meta[name="maptiler-key"]')?.content?.trim() || "";
-
-  if (!MAPTILER_KEY) {
-    console.warn("⚠️ MapTiler APIキーが未設定です。<meta name=\"maptiler-key\" ... > を入れてください。");
+  if (!window.maplibregl) {
+    throw new Error("MapLibre(GL) が読み込まれていません。HTMLに maplibre-gl の <script> を追加してください。");
   }
 
-  // 2) 使うスタイル（地名・POIが出る “streets-v2” を推奨）
-  // ほか: outdoor-v2 / basic-v2 / topo-v2 など
-  const STYLE = `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`;
+  const styleUrl = MAPTILER_KEY
+    ? `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`
+    : "https://demotiles.maplibre.org/style.json"; // フォールバック
 
-  // 3) MapLibre マップ生成
-  window.map = new maplibregl.Map({
+  mlMap = new maplibregl.Map({
     container: "map",
-    style: STYLE,
-    center: [139.7000, 35.6800], // 初期表示（新宿周辺など）
-    zoom: 10
+    style: styleUrl,
+    center: [139.7, 35.68],
+    zoom: 10,
+    attributionControl: true,
   });
+  mlMap.addControl(new maplibregl.NavigationControl(), "top-right");
+  return mlMap;
+}
 
-  // ズーム・向きコントロール
-  window.map.addControl(new maplibregl.NavigationControl(), "top-right");
+/* ========= GeoJSON を地図に描画 ========= */
+function renderGeo(geojson) {
+  const m = ensureMap();
+  if (typeof m.getSource !== "function") {
+    throw new Error("MapLibre map not initialized correctly.");
+  }
 
-  // 著作表示（MapTiler のクレジットは必須）
-  window.map.addControl(
-    new maplibregl.AttributionControl({
-      customAttribution: '© MapTiler © OpenStreetMap contributors'
-    })
-  );
+  const ROUTE_SRC = "route-src";
+  const ROUTE_LAYER = "route-layer";
+  const PT_SRC = "pt-src";
+  const STAY_LAYER = "stay-layer";
+  const VISIT_LAYER = "visit-layer";
 
-  // あなたの既存処理：ソース/レイヤの作成（なければ初期化）
-  window.map.on("load", () => {
-    if (!window.map.getSource("timeline")) {
-      window.map.addSource("timeline", {
+  const onReady = () => {
+    // 既存レイヤ/ソース掃除
+    [ROUTE_LAYER, STAY_LAYER, VISIT_LAYER].forEach(id => { if (m.getLayer(id)) m.removeLayer(id); });
+    [ROUTE_SRC, PT_SRC].forEach(id => { if (m.getSource(id)) m.removeSource(id); });
+
+    // LineString を抽出
+    const lineFeatures = [];
+    const pointFeatures = [];
+    (geojson.features || []).forEach(f => {
+      if (!f || !f.geometry) return;
+      if (f.geometry.type === "LineString") lineFeatures.push(f);
+      if (f.geometry.type === "Point") pointFeatures.push(f);
+    });
+
+    if (lineFeatures.length) {
+      m.addSource(ROUTE_SRC, {
         type: "geojson",
-        data: { type: "FeatureCollection", features: [] }
+        data: { type: "FeatureCollection", features: lineFeatures }
+      });
+      m.addLayer({
+        id: ROUTE_LAYER,
+        type: "line",
+        source: ROUTE_SRC,
+        paint: { "line-color": "#d9534f", "line-width": 4, "line-opacity": 0.9 }
       });
     }
 
-    // 既存のレイヤ追加（例：滞在/立寄り/移動線）
-    if (!window.map.getLayer("trip-lines")) {
-      window.map.addLayer({
-        id: "trip-lines",
-        type: "line",
-        source: "timeline",
-        filter: ["==", ["get", "layer"], "trip"],
-        layout: { "line-join": "round", "line-cap": "round" },
-        paint: { "line-color": "#d85866", "line-width": 4, "line-opacity": 0.9 }
+    if (pointFeatures.length) {
+      m.addSource(PT_SRC, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: pointFeatures }
       });
-    }
-    if (!window.map.getLayer("stay-points")) {
-      window.map.addLayer({
-        id: "stay-points",
+      m.addLayer({
+        id: STAY_LAYER,
         type: "circle",
-        source: "timeline",
-        filter: ["==", ["get", "layer"], "stay"],
-        paint: {
-          "circle-radius": 7,
-          "circle-color": "#1e3a8a",
-          "circle-stroke-color": "#ffffff",
-          "circle-stroke-width": 2
-        }
-      });
-    }
-    if (!window.map.getLayer("visit-points")) {
-      window.map.addLayer({
-        id: "visit-points",
-        type: "circle",
-        source: "timeline",
-        filter: ["==", ["get", "layer"], "visit"],
+        source: PT_SRC,
+        filter: ["==", ["get", "kind"], "stay"],
         paint: {
           "circle-radius": 6,
-          "circle-color": "#0ea5e9",
+          "circle-color": "#2e7d32",
           "circle-stroke-color": "#ffffff",
           "circle-stroke-width": 2
         }
       });
+      m.addLayer({
+        id: VISIT_LAYER,
+        type: "circle",
+        source: PT_SRC,
+        filter: ["==", ["get", "kind"], "visit"],
+        paint: {
+          "circle-radius": 6,
+          "circle-color": "#1976d2",
+          "circle-stroke-color": "#ffffff",
+          "circle-stroke-width": 2
+        }
+      });
+
+      // クリックでポップアップ
+      const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: true });
+      [STAY_LAYER, VISIT_LAYER].forEach(layerId => {
+        m.on("click", layerId, (e) => {
+          const f = e.features && e.features[0];
+          if (!f) return;
+          const [lon, lat] = f.geometry.coordinates;
+          const p = f.properties || {};
+          const label = p.label || "";
+          const start = p.start || "";
+          const end   = p.end || "";
+          popup.setLngLat([lon, lat]).setHTML(`
+            <div style="font-size:12px">
+              <div><b>${p.kind === "stay" ? "滞在" : "立寄り"}</b></div>
+              ${label ? `<div>${escapeHtml(label)}</div>` : ""}
+              ${start ? `<div>開始: ${escapeHtml(start)}</div>` : ""}
+              ${end   ? `<div>終了: ${escapeHtml(end)}</div>` : ""}
+            </div>`).addTo(m);
+        });
+        m.on("mouseenter", layerId, () => { m.getCanvas().style.cursor = "pointer"; });
+        m.on("mouseleave", layerId, () => { m.getCanvas().style.cursor = ""; });
+      });
+    }
+
+    // 画面フィット
+    try {
+      if (window.turf) {
+        const bbox = turf.bbox(geojson);
+        m.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 400 });
+      } else {
+        const coords = [];
+        lineFeatures.forEach(f => coords.push(...f.geometry.coordinates));
+        pointFeatures.forEach(f => coords.push(f.geometry.coordinates));
+        if (coords.length) {
+          const xs = coords.map(c => c[0]);
+          const ys = coords.map(c => c[1]);
+          const sw = [Math.min(...xs), Math.min(...ys)];
+          const ne = [Math.max(...xs), Math.max(...ys)];
+          m.fitBounds([sw, ne], { padding: 40, duration: 400 });
+        }
+      }
+    } catch {}
+  };
+
+  if (mlMap.loaded()) onReady(); else mlMap.once("load", onReady);
+}
+
+/* ========= サマリ計算 ========= */
+function haversineKm(a, b) {
+  const R = 6371;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b[1] - a[1]);
+  const dLon = toRad(b[0] - a[0]);
+  const lat1 = toRad(a[1]);
+  const lat2 = toRad(b[1]);
+  const h = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+function totalDistanceKm(geojson) {
+  try {
+    if (window.turf) {
+      // すべての LineString を合算
+      return (geojson.features || []).reduce((sum, f) => {
+        if (f.geometry?.type === "LineString") {
+          return sum + turf.length(f, { units: "kilometers" });
+        }
+        return sum;
+      }, 0);
+    }
+  } catch {}
+  // Turf なし: 簡易合算
+  let total = 0;
+  (geojson.features || []).forEach(f => {
+    if (f.geometry?.type !== "LineString") return;
+    const cs = f.geometry.coordinates || [];
+    for (let i = 1; i < cs.length; i++) total += haversineKm(cs[i-1], cs[i]);
+  });
+  return total;
+}
+
+function updateSummary(payload) {
+  const stays  = payload.stays  || [];
+  const visits = payload.visits || [];
+  const geo    = payload.geojson || { type: "FeatureCollection", features: [] };
+  const distKm = totalDistanceKm(geo);
+
+  elSummary.innerHTML = "";
+  const add = (label, value) => {
+    const li = document.createElement("li");
+    li.textContent = `${label}: ${value}`;
+    elSummary.appendChild(li);
+  };
+  add("滞在件数", stays.length);
+  add("立寄り件数", visits.length);
+  add("移動距離(概算)", `${distKm.toFixed(2)} km`);
+}
+
+/* ========= 日記表示 ========= */
+function updateDiary(payload) {
+  const txt = (payload.diary || "").trim();
+  elDiary.textContent = txt || "（この日の日記はまだありません）";
+}
+
+/* ========= フェッチ & 描画 ========= */
+async function loadTimeline() {
+  const deviceId = (elDevice.value || "").trim();
+  const date = (elDate.value || "").trim();
+  if (!API_BASE) {
+    setStatus("⚠️ API Base が未設定です。<meta name=\"api-base\"> を設定してください。");
+    return;
+  }
+  if (!deviceId || !date) {
+    setStatus("⚠️ Device ID と 日付 を指定してください。");
+    return;
+  }
+
+  // 保存（次回のデフォルトに）
+  localStorage.setItem("viewer:deviceId", deviceId);
+  localStorage.setItem("viewer:date", date);
+
+  setStatus("読み込み中…");
+  try {
+    const url = `${API_BASE}/timeline?deviceId=${encodeURIComponent(deviceId)}&date=${encodeURIComponent(date)}`;
+    const headers = { "Content-Type": "application/json" };
+    if (API_KEY) headers["x-api-key"] = API_KEY;
+
+    const resp = await fetch(url, { headers, method: "GET" });
+    const json = await resp.json().catch(() => ({}));
+    elRaw.textContent = JSON.stringify(json, null, 2);
+
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${JSON.stringify(json)}`);
+
+    // geojson が無ければ作る（後方互換）
+    let geo = json.geojson;
+    if (!geo || !geo.features) {
+      geo = buildGeoJsonFromPayload(json);
+      json.geojson = geo;
+    }
+
+    renderGeo(geo);
+    updateSummary(json);
+    updateDiary(json);
+    setStatus("読み込み完了");
+  } catch (e) {
+    console.error(e);
+    setStatus("読み込みに失敗しました。コンソールをご確認ください。");
+  }
+}
+
+// 後方互換: stays/visits/trips から最低限の GeoJSON を作る
+function buildGeoJsonFromPayload(p) {
+  const feats = [];
+
+  // trips: {geometry: {type:LineString, coordinates:[...]}}
+  (p.trips || []).forEach(tr => {
+    if (tr.geometry?.type === "LineString") {
+      feats.push({
+        type: "Feature",
+        properties: { kind: "trip" },
+        geometry: { type: "LineString", coordinates: tr.geometry.coordinates }
+      });
     }
   });
 
-  return window.map;
+  // stays/visits を点に
+  (p.stays || []).forEach(s => {
+    if (!s.center) return;
+    feats.push({
+      type: "Feature",
+      properties: {
+        kind: "stay",
+        label: s.label || "",
+        start: s.start || "",
+        end: s.end || ""
+      },
+      geometry: { type: "Point", coordinates: [s.center.lon, s.center.lat] }
+    });
+  });
+
+  (p.visits || []).forEach(v => {
+    if (!v.center) return;
+    feats.push({
+      type: "Feature",
+      properties: {
+        kind: "visit",
+        label: v.label || "",
+        start: v.start || "",
+        end: v.end || ""
+      },
+      geometry: { type: "Point", coordinates: [v.center.lon, v.center.lat] }
+    });
+  });
+
+  return { type: "FeatureCollection", features: feats };
 }
 
-
-// GeoJSON描画（LineString + stays/visits の points をマージ）
-function renderGeo(fc, stays, visits) {
-  const m = ensureMap();
-  if (!m) return;
-  const base = (fc && Array.isArray(fc.features)) ? fc : { type:'FeatureCollection', features: [] };
-  const features = [...base.features];
-
-  // stays → Point
-  if (Array.isArray(stays)) {
-    for (const s of stays) {
-      const c = s?.center || {};
-      const lat = parseFloat(c.lat ?? c.latitude);
-      const lon = parseFloat(c.lon ?? c.longitude);
-      if (Number.isFinite(lat) && Number.isFinite(lon)) {
-        features.push({
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: [lon, lat] },
-          properties: { kind: 'stay', label: s.label || '' }
-        });
-      }
-    }
-  }
-  // visits → Point
-  if (Array.isArray(visits)) {
-    for (const v of visits) {
-      const c = v?.center || {};
-      const lat = parseFloat(c.lat ?? c.latitude);
-      const lon = parseFloat(c.lon ?? c.longitude);
-      if (Number.isFinite(lat) && Number.isFinite(lon)) {
-        features.push({
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: [lon, lat] },
-          properties: { kind: 'visit', label: v.label || '' }
-        });
-      }
-    }
-  }
-
-  const merged = { type: 'FeatureCollection', features };
-  if (m.getSource('timeline')) {
-    m.getSource('timeline').setData(merged);
-  }
-
-  // フィット
-  try {
-    const bbox = turf.bbox(merged);
-    m.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 800 });
-  } catch {
-    const line = features.find(f => f.geometry?.type === 'LineString');
-    if (line) {
-      const coords = line.geometry.coordinates;
-      if (coords?.length) {
-        const mid = coords[Math.floor(coords.length/2)];
-        m.setCenter(mid);
-        m.setZoom(11);
-      }
-    }
-  }
-}
-
-// サマリ描画（合計距離・件数）
-function renderSummary(trips) {
-  const list = Array.isArray(trips) ? trips : [];
-  const sumKm = list.reduce((acc, t) => acc + (Number(t?.distance_km) || 0), 0);
-  const items = [
-    `合計距離: ${sumKm.toFixed(2)} km`,
-    `移動回数: ${list.length}`
-  ];
-  elSummary.innerHTML = items.map(s => `<li>${escapeHtml(s)}</li>`).join('');
-}
-
-// 日記描画
-function renderDiary(text) {
-  const t = (text || '').trim();
-  elDiary.textContent = t || '（この日の自動日記はありません）';
-}
-
-// ステータス
+/* ========= ユーティリティ ========= */
 function setStatus(msg) {
-  elStatus.textContent = msg || '';
+  elStatus.textContent = msg;
 }
-
-// JSON表示
-function renderRaw(obj) {
-  try {
-    elRaw.textContent = JSON.stringify(obj, null, 2);
-  } catch {
-    elRaw.textContent = String(obj);
-  }
-}
-
-// ---- 読み込み処理 ----
-async function loadTimeline() {
-  const api = getApiBase();
-  const key = getApiKey();
-  const deviceId = (elDevice.value || '').trim();
-  const date = (elDate.value || '').trim();
-
-  if (!api) { alert('API Base が未設定です（metaタグ）'); return; }
-  if (!deviceId || !date) { alert('Device ID と日付を入力してください'); return; }
-
-  setStatus('読み込み中…');
-  try {
-    const url = `${api.replace(/\/$/, '')}/timeline?deviceId=${encodeURIComponent(deviceId)}&date=${encodeURIComponent(date)}`;
-    const headers = { 'Content-Type': 'application/json' };
-    if (key) headers['x-api-key'] = key;
-
-    const resp = await fetch(url, { method: 'GET', headers });
-    const json = await resp.json().catch(() => ({}));
-    renderRaw(json);
-
-    if (!resp.ok) {
-      setStatus(`エラー: HTTP ${resp.status}`);
-      return;
-    }
-
-    // サマリ
-    renderSummary(json.trips || []);
-    // 地図（geojson + stays + visits）
-    renderGeo(json.geojson || {type:'FeatureCollection', features:[]}, json.stays || [], json.visits || []);
-    // 日記
-    renderDiary(json.diary || '');
-
-    setStatus('読み込み完了');
-  } catch (e) {
-    console.error(e);
-    setStatus('読み込みに失敗しました（Console参照）');
-  }
-}
-
-// ---- 日付ナビ ----
-function shiftDate(days) {
-  const d = new Date(elDate.value || Date.now());
-  d.setUTCDate(d.getUTCDate() + days);
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  elDate.value = `${yyyy}-${mm}-${dd}`;
-}
-
-// ---- Utils ----
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
+function addDays(isoDate, delta) {
+  const d = new Date(isoDate);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
 
-// ---- 起動 ----
-document.addEventListener('DOMContentLoaded', () => {
-  ensureMap(); // 先に地図準備
-  btnLoad?.addEventListener('click', loadTimeline);
-  btnPrev?.addEventListener('click', () => { shiftDate(-1); loadTimeline(); });
-  btnNext?.addEventListener('click', () => { shiftDate(+1); loadTimeline(); });
+/* ========= イベント ========= */
+elLoad?.addEventListener("click", loadTimeline);
+elPrev?.addEventListener("click", () => { elDate.value = addDays(elDate.value, -1); loadTimeline(); });
+elNext?.addEventListener("click", () => { elDate.value = addDays(elDate.value, +1); loadTimeline(); });
 
-  // URLパラメータで deviceId/date を受け取ったら初期セット
-  const u = new URL(location.href);
-  const did = u.searchParams.get('deviceId');
-  const dt  = u.searchParams.get('date');
-  if (did) elDevice.value = did;
-  if (dt)  elDate.value   = dt;
+/* ========= 初期化 ========= */
+document.addEventListener("DOMContentLoaded", () => {
+  // 入力の復元
+  const savedDev = localStorage.getItem("viewer:deviceId") || "";
+  const savedDate = localStorage.getItem("viewer:date") || new Date().toISOString().slice(0,10);
+  if (savedDev) elDevice.value = savedDev;
+  if (savedDate) elDate.value = savedDate;
 
-  // どちらも指定があれば自動読み込み
-  if (elDevice.value && elDate.value) {
-    loadTimeline();
+  // 地図だけ先に作成
+  try { ensureMap(); } catch (e) { console.warn(e.message); }
+
+  if (API_BASE && savedDev) {
+    // 自動ロードしたければここで呼ぶ
+    // loadTimeline();
+  } else if (!API_BASE) {
+    setStatus("⚠️ API Base が未設定です。<meta name=\"api-base\"> を設定してください。");
   }
 });
